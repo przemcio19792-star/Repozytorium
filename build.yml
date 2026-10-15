@@ -1,0 +1,660 @@
+name: Zbuduj Wykrywacz przewodów
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Utwórz pliki projektu
+        run: |
+          mkdir -p .
+          cat > settings.gradle <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WykrywaczPrzewodow"
+          include ':app'
+          EOF_0
+          mkdir -p .
+          cat > build.gradle <<'EOF_1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_1
+          mkdir -p .
+          cat > gradle.properties <<'EOF_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          EOF_2
+          mkdir -p app
+          cat > app/build.gradle <<'EOF_3'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'pl.wykrywacz.przewodow'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "pl.wykrywacz.przewodow"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <uses-feature
+                  android:name="android.hardware.sensor.compass"
+                  android:required="false" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Wykrywacz przewodów"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF_4
+          mkdir -p app/src/main/java/pl/wykrywacz/przewodow
+          cat > app/src/main/java/pl/wykrywacz/przewodow/MainActivity.java <<'EOF_5'
+          package pl.wykrywacz.przewodow;
+
+          import android.app.Activity;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.hardware.Sensor;
+          import android.hardware.SensorEvent;
+          import android.hardware.SensorEventListener;
+          import android.hardware.SensorManager;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.os.Vibrator;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+
+          import java.util.Locale;
+
+          /**
+           * Wykrywacz przewodow: magnetometr telefonu.
+           * - pole zmienne 50 Hz (przewod pod pradem): sila + kierunek (lewo/prawo/gora/dol/srodek)
+           * - pole stale (metal, zelazo): pasek wzgledem skalibrowanego tla
+           */
+          public class MainActivity extends Activity implements SensorEventListener {
+
+              private static final int BG = 0xFF10161C;
+              private static final int PANEL = 0xFF18212A;
+              private static final int FG = 0xFFE8EEF3;
+              private static final int MUTED = 0xFF8FA1B0;
+              private static final int ACCENT = 0xFFFFB020;
+              private static final int GOOD = 0xFF3DDC84;
+              private static final int OFF = 0xFF233039;
+              private static final int OFF_TEXT = 0xFF41525F;
+
+              // czujnik
+              private SensorManager sm;
+              private Sensor mag;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              // filtry
+              private long lastT = 0;
+              private double lpx, lpy, lpz;          // wolny filtr: pole Ziemi, ruch reki
+              private double sx, sy, sz;             // filtr do pola stalego (metal)
+              private double cxx, cyy, czz, cxy, cxz, cyz;   // kowariancje skladowej zmiennej
+              private double lastRms = 0;
+              private int sampleCount = 0;
+              private long rateStartMs = 0;
+              private double rateHz = 0;
+
+              // kalibracja
+              private boolean hasBase = false;
+              private boolean calibrating = false;
+              private long calEnd = 0;
+              private double bx, by, bz, acBase = 0;
+              private double calSx, calSy, calSz, calAc;
+              private int calN = 0;
+
+              // ustawienia i wyniki
+              private boolean flip = false;
+              private double threshold = 0.6;
+              private double acHold = 0;
+              private double acPeak = 0;
+              private double metalPeak = 0;
+
+              // interfejs
+              private TextView status, tvUp, tvDown, tvLeft, tvRight, tvCenter;
+              private TextView acLabel, metalLabel, sensLabel;
+              private Bar acBar, metalBar;
+              private final int[] cellState = new int[5];   // 0 wylaczone, 1 pomaranczowe, 2 zielone
+              private Vibrator vibrator;
+              private long lastVibrate = 0;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  sm = (SensorManager) getSystemService(SENSOR_SERVICE);
+                  mag = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+                  vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                  buildUi();
+                  if (mag == null) {
+                      status.setText("Ten telefon nie ma magnetometru, wykrywacz nie zadziała.");
+                  }
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (mag != null) {
+                      lastT = 0;
+                      sampleCount = 0;
+                      rateStartMs = SystemClock.elapsedRealtime();
+                      sm.registerListener(this, mag, SensorManager.SENSOR_DELAY_FASTEST);
+                      handler.post(tick);
+                  }
+              }
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  sm.unregisterListener(this);
+                  handler.removeCallbacks(tick);
+              }
+
+              @Override
+              public void onAccuracyChanged(Sensor sensor, int accuracy) {
+              }
+
+              // ------------------------------------------------------------------ czujnik
+
+              @Override
+              public void onSensorChanged(SensorEvent e) {
+                  double x = e.values[0];
+                  double y = e.values[1];
+                  double z = e.values[2];
+                  long t = e.timestamp;
+                  if (lastT == 0) {
+                      lastT = t;
+                      lpx = x; lpy = y; lpz = z;
+                      sx = x; sy = y; sz = z;
+                      return;
+                  }
+                  double dt = (t - lastT) * 1e-9;
+                  lastT = t;
+                  if (dt <= 0 || dt > 0.5) {
+                      return;
+                  }
+                  sampleCount++;
+
+                  double a = 1.0 - Math.exp(-dt / 0.08);
+                  lpx += a * (x - lpx);
+                  lpy += a * (y - lpy);
+                  lpz += a * (z - lpz);
+
+                  double s = 1.0 - Math.exp(-dt / 0.15);
+                  sx += s * (x - sx);
+                  sy += s * (y - sy);
+                  sz += s * (z - sz);
+
+                  double hx = x - lpx;
+                  double hy = y - lpy;
+                  double hz = z - lpz;
+
+                  double b = 1.0 - Math.exp(-dt / 0.3);
+                  cxx += b * (hx * hx - cxx);
+                  cyy += b * (hy * hy - cyy);
+                  czz += b * (hz * hz - czz);
+                  cxy += b * (hx * hy - cxy);
+                  cxz += b * (hx * hz - cxz);
+                  cyz += b * (hy * hz - cyz);
+                  lastRms = Math.sqrt(cxx + cyy + czz);
+
+                  if (calibrating) {
+                      calSx += sx; calSy += sy; calSz += sz; calAc += lastRms;
+                      calN++;
+                      if (t >= calEnd && calN > 20) {
+                          bx = calSx / calN; by = calSy / calN; bz = calSz / calN;
+                          acBase = calAc / calN;
+                          hasBase = true;
+                          calibrating = false;
+                          acHold = 0;
+                          acPeak = 0;
+                          metalPeak = 0;
+                          status.setText("Tło zapisane. Przyłóż telefon płasko do ściany ekranem do siebie i przesuwaj powoli.");
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ odswiezanie
+
+              private final Runnable tick = new Runnable() {
+                  @Override
+                  public void run() {
+                      update();
+                      handler.postDelayed(this, 50);
+                  }
+              };
+
+              private void update() {
+                  long now = SystemClock.elapsedRealtime();
+                  if (now - rateStartMs >= 2000) {
+                      rateHz = sampleCount * 1000.0 / (now - rateStartMs);
+                      sampleCount = 0;
+                      rateStartMs = now;
+                      if (!calibrating && !hasBase) {
+                          status.setText(String.format(Locale.US,
+                                  "Czujnik działa (%.0f odczytów/s). Odsuń telefon od ściany i naciśnij Kalibruj.", rateHz));
+                      }
+                  }
+
+                  // pole zmienne (przewod pod pradem)
+                  double ac = Math.max(0.0, lastRms - acBase);
+                  acHold = Math.max(ac, acHold * 0.96);
+                  if (acHold > acPeak) {
+                      acPeak = acHold;
+                  }
+                  acLabel.setText(String.format(Locale.US,
+                          "Przewód pod prądem: %.2f µT   (szczyt %.2f)", acHold, acPeak));
+                  acBar.set(Math.sqrt(Math.min(1.0, acHold / 5.0)));
+
+                  // pole stale (metal)
+                  double metal = 0;
+                  if (hasBase) {
+                      double dx = sx - bx, dy = sy - by, dz = sz - bz;
+                      metal = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                  }
+                  if (metal > metalPeak) {
+                      metalPeak = metal;
+                  }
+                  metalLabel.setText(String.format(Locale.US,
+                          "Metal: %.1f µT   (szczyt %.1f)", metal, metalPeak));
+                  metalBar.set(Math.sqrt(Math.min(1.0, metal / 40.0)));
+
+                  // kierunek
+                  boolean up = false, down = false, left = false, right = false, center = false;
+                  if (acHold >= threshold && lastRms > 1e-6) {
+                      double tr = cxx + cyy;
+                      double det = cxx * cyy - cxy * cxy;
+                      double disc = Math.sqrt(Math.max(0.0, tr * tr / 4.0 - det));
+                      double lam = tr / 2.0 + disc;
+                      double ux, uy;
+                      if (Math.abs(cxy) > 1e-12) {
+                          ux = cxy;
+                          uy = lam - cxx;
+                      } else if (cxx >= cyy) {
+                          ux = 1.0;
+                          uy = 0.0;
+                      } else {
+                          ux = 0.0;
+                          uy = 1.0;
+                      }
+                      double n = Math.hypot(ux, uy);
+                      ux /= n;
+                      uy /= n;
+                      double cov = ux * cxz + uy * cyz;
+                      double ratio = Math.sqrt(czz / Math.max(lam, 1e-12));
+                      if (ratio < 0.35) {
+                          center = true;
+                      } else {
+                          double sign = (cov >= 0) ? 1.0 : -1.0;
+                          if (flip) {
+                              sign = -sign;
+                          }
+                          double dirX = ux * sign;
+                          double dirY = uy * sign;
+                          if (Math.abs(dirX) >= Math.abs(dirY)) {
+                              if (dirX > 0) right = true; else left = true;
+                          } else {
+                              if (dirY > 0) up = true; else down = true;
+                          }
+                      }
+                  }
+                  setCell(0, tvUp, up, false);
+                  setCell(1, tvLeft, left, false);
+                  setCell(2, tvCenter, center, true);
+                  setCell(3, tvRight, right, false);
+                  setCell(4, tvDown, down, false);
+                  if (center && now - lastVibrate > 400) {
+                      lastVibrate = now;
+                      try {
+                          vibrator.vibrate(30);
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ interfejs
+
+              private int dp(int v) {
+                  return Math.round(v * getResources().getDisplayMetrics().density);
+              }
+
+              private TextView text(String s, int sp, int color) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  return t;
+              }
+
+              private TextView cell(String s, int sp) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setGravity(Gravity.CENTER);
+                  t.setTypeface(Typeface.DEFAULT_BOLD);
+                  paintCell(t, 0);
+                  return t;
+              }
+
+              private void paintCell(TextView t, int state) {
+                  GradientDrawable g = new GradientDrawable();
+                  g.setCornerRadius(dp(14));
+                  if (state == 0) {
+                      g.setColor(OFF);
+                      t.setTextColor(OFF_TEXT);
+                  } else {
+                      g.setColor(state == 2 ? GOOD : ACCENT);
+                      t.setTextColor(BG);
+                  }
+                  t.setBackground(g);
+              }
+
+              private void setCell(int index, TextView t, boolean on, boolean green) {
+                  int state = on ? (green ? 2 : 1) : 0;
+                  if (cellState[index] != state) {
+                      cellState[index] = state;
+                      paintCell(t, state);
+                  }
+              }
+
+              private LinearLayout.LayoutParams weighted(float w) {
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, w);
+                  p.setMargins(dp(4), dp(4), dp(4), dp(4));
+                  return p;
+              }
+
+              private LinearLayout row() {
+                  LinearLayout r = new LinearLayout(this);
+                  r.setOrientation(LinearLayout.HORIZONTAL);
+                  r.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(78)));
+                  return r;
+              }
+
+              private class Bar {
+                  final LinearLayout box;
+                  final View fill;
+                  final View rest;
+
+                  Bar(int color) {
+                      box = new LinearLayout(MainActivity.this);
+                      box.setOrientation(LinearLayout.HORIZONTAL);
+                      GradientDrawable track = new GradientDrawable();
+                      track.setCornerRadius(dp(8));
+                      track.setColor(OFF);
+                      box.setBackground(track);
+                      box.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(16)));
+                      fill = new View(MainActivity.this);
+                      GradientDrawable f = new GradientDrawable();
+                      f.setCornerRadius(dp(8));
+                      f.setColor(color);
+                      fill.setBackground(f);
+                      rest = new View(MainActivity.this);
+                      box.addView(fill, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0f));
+                      box.addView(rest, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f));
+                  }
+
+                  void set(double frac) {
+                      float f = (float) Math.max(0.0, Math.min(1.0, frac));
+                      ((LinearLayout.LayoutParams) fill.getLayoutParams()).weight = f;
+                      ((LinearLayout.LayoutParams) rest.getLayoutParams()).weight = 1f - f;
+                      box.requestLayout();
+                  }
+              }
+
+              private Button button(String s) {
+                  Button b = new Button(this);
+                  b.setText(s);
+                  b.setAllCaps(false);
+                  b.setTextColor(FG);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setCornerRadius(dp(12));
+                  g.setColor(PANEL);
+                  g.setStroke(dp(1), 0xFF2A3744);
+                  b.setBackground(g);
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(52), 1f);
+                  p.setMargins(dp(4), dp(4), dp(4), dp(4));
+                  b.setLayoutParams(p);
+                  return b;
+              }
+
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.setBackgroundColor(BG);
+                  scroll.setFillViewport(true);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(28), dp(16), dp(24));
+                  scroll.addView(root, new ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  TextView title = text("Wykrywacz przewodów", 22, FG);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  root.addView(title);
+
+                  status = text("Uruchamiam czujnik...", 14, FG);
+                  status.setPadding(dp(12), dp(10), dp(12), dp(10));
+                  GradientDrawable sb = new GradientDrawable();
+                  sb.setCornerRadius(dp(12));
+                  sb.setColor(PANEL);
+                  status.setBackground(sb);
+                  LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  sp.setMargins(0, dp(12), 0, dp(12));
+                  root.addView(status, sp);
+
+                  tvUp = cell("▲", 28);
+                  tvDown = cell("▼", 28);
+                  tvLeft = cell("◀", 32);
+                  tvRight = cell("▶", 32);
+                  tvCenter = cell("TU", 20);
+
+                  LinearLayout r1 = row();
+                  r1.addView(new View(this), weighted(1f));
+                  r1.addView(tvUp, weighted(1f));
+                  r1.addView(new View(this), weighted(1f));
+                  LinearLayout r2 = row();
+                  r2.addView(tvLeft, weighted(1f));
+                  r2.addView(tvCenter, weighted(1f));
+                  r2.addView(tvRight, weighted(1f));
+                  LinearLayout r3 = row();
+                  r3.addView(new View(this), weighted(1f));
+                  r3.addView(tvDown, weighted(1f));
+                  r3.addView(new View(this), weighted(1f));
+                  root.addView(r1);
+                  root.addView(r2);
+                  root.addView(r3);
+
+                  acLabel = text("Przewód pod prądem: 0.00 µT", 15, FG);
+                  LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp1.setMargins(0, dp(16), 0, dp(6));
+                  root.addView(acLabel, lp1);
+                  acBar = new Bar(ACCENT);
+                  root.addView(acBar.box);
+
+                  metalLabel = text("Metal: 0.0 µT", 15, FG);
+                  LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp2.setMargins(0, dp(14), 0, dp(6));
+                  root.addView(metalLabel, lp2);
+                  metalBar = new Bar(0xFF5AA9FF);
+                  root.addView(metalBar.box);
+
+                  LinearLayout buttons = new LinearLayout(this);
+                  buttons.setOrientation(LinearLayout.HORIZONTAL);
+                  LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  bp.setMargins(0, dp(18), 0, 0);
+                  Button calBtn = button("Kalibruj tło");
+                  Button flipBtn = button("Odwróć strzałki");
+                  Button resetBtn = button("Zeruj szczyt");
+                  buttons.addView(calBtn);
+                  buttons.addView(flipBtn);
+                  buttons.addView(resetBtn);
+                  root.addView(buttons, bp);
+
+                  calBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          if (lastT == 0) {
+                              status.setText("Brak odczytów z czujnika.");
+                              return;
+                          }
+                          calSx = 0; calSy = 0; calSz = 0; calAc = 0; calN = 0;
+                          calEnd = lastT + 1000000000L;
+                          calibrating = true;
+                          status.setText("Kalibracja... trzymaj telefon nieruchomo, z dala od ściany.");
+                      }
+                  });
+                  flipBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          flip = !flip;
+                          status.setText(flip ? "Strzałki odwrócone." : "Strzałki w ustawieniu domyślnym.");
+                      }
+                  });
+                  resetBtn.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          acPeak = 0;
+                          metalPeak = 0;
+                          acHold = 0;
+                      }
+                  });
+
+                  sensLabel = text("Czułość: próg 0.60 µT", 14, MUTED);
+                  LinearLayout.LayoutParams lp3 = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp3.setMargins(0, dp(16), 0, 0);
+                  root.addView(sensLabel, lp3);
+                  SeekBar seek = new SeekBar(this);
+                  seek.setMax(100);
+                  seek.setProgress(10);
+                  seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override
+                      public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                          threshold = 0.1 + progress * 0.05;
+                          sensLabel.setText(String.format(Locale.US, "Czułość: próg %.2f µT", threshold));
+                      }
+
+                      @Override
+                      public void onStartTrackingTouch(SeekBar bar) {
+                      }
+
+                      @Override
+                      public void onStopTrackingTouch(SeekBar bar) {
+                      }
+                  });
+                  root.addView(seek);
+
+                  TextView help = text(
+                          "1. Odsuń telefon od ściany i naciśnij Kalibruj tło.\n"
+                                  + "2. Przyłóż telefon płasko do ściany ekranem do siebie i przesuwaj powoli.\n"
+                                  + "3. Strzałka pokazuje, w którą stronę jest przewód pod prądem. TU oznacza, że jesteś nad nim. "
+                                  + "Gdy strzałka kłamie, naciśnij Odwróć strzałki.\n"
+                                  + "4. Włącz w badanym obwodzie jakieś obciążenie, np. lampę. Bez prądu przewód jest niewidoczny.\n\n"
+                                  + "Wynik jest orientacyjny: dwużyłowy przewód zasilający daje słabe pole, "
+                                  + "a metal (rury, śruby, puszki) widać na dolnym pasku. "
+                                  + "Przed wierceniem wyłącz bezpieczniki.",
+                          13, MUTED);
+                  LinearLayout.LayoutParams lp4 = new LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp4.setMargins(0, dp(18), 0, 0);
+                  root.addView(help, lp4);
+
+                  setContentView(scroll);
+              }
+          }
+          EOF_5
+
+      - name: Zainstaluj Javę
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Zainstaluj Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Zbuduj aplikację
+        run: gradle assembleDebug --no-daemon
+
+      - name: Przygotuj plik APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk Wykrywacz-przewodow.apk
+
+      - name: Zachowaj APK jako załącznik
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wykrywacz-przewodow
+          path: Wykrywacz-przewodow.apk
+
+      - name: Opublikuj APK do pobrania
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Wykrywacz przewodów v${{ github.run_number }}
+          files: Wykrywacz-przewodow.apk
